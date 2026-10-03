@@ -1,6 +1,7 @@
 package balancer
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -178,4 +179,94 @@ func TestAllCircuitsOpen(t *testing.T) {
 		}
 	}
 	t.Fatal("proxy did not reject after the circuit opened")
+}
+
+func TestRateLimitsIgnoreForwardedIP(t *testing.T) {
+	var calls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+	}))
+	defer upstream.Close()
+	_, proxy := testProxy(t, Config{Backends: []string{upstream.URL}, Timeout: time.Second, Rate: 0.1, Burst: 1})
+	for i, want := range []int{200, 429} {
+		req, _ := http.NewRequest("GET", proxy.URL, nil)
+		req.Header.Set("X-Forwarded-For", fmt.Sprintf("198.51.100.%d", i+1))
+		res, err := proxy.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != want || (want == 429 && res.Header.Get("Retry-After") == "") {
+			t.Fatalf("status = %d, want %d with retry header", res.StatusCode, want)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatal("rejected request reached backend")
+	}
+}
+
+func TestBodyLimit(t *testing.T) {
+	var calls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		calls.Add(1)
+		if len(body) != maxRequestBytes {
+			t.Errorf("body length = %d", len(body))
+		}
+	}))
+	defer upstream.Close()
+	b, proxy := testProxy(t, Config{Backends: []string{upstream.URL}, Timeout: time.Second})
+	for _, size := range []int{maxRequestBytes, maxRequestBytes + 1} {
+		req, _ := http.NewRequest("POST", proxy.URL, bytes.NewReader(make([]byte, size)))
+		req.ContentLength = -1
+		res, err := proxy.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		want := 200
+		if size > maxRequestBytes {
+			want = 413
+		}
+		if res.StatusCode != want {
+			t.Fatalf("size %d: got %d, want %d", size, res.StatusCode, want)
+		}
+	}
+	if calls.Load() != 1 || b.pool.backends[0].failures != 0 {
+		t.Fatal("oversized request reached backend or changed its health")
+	}
+}
+
+func TestCapacityRejectsWithoutQueueing(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+	}))
+	defer upstream.Close()
+	b, proxy := testProxy(t, Config{Backends: []string{upstream.URL}, Timeout: time.Second})
+	b.slots = make(chan struct{}, 1)
+	first := make(chan error, 1)
+	go func() {
+		res, err := proxy.Client().Get(proxy.URL)
+		if err == nil {
+			res.Body.Close()
+		}
+		first <- err
+	}()
+	defer close(release)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("backend did not receive first request")
+	}
+	res, err := proxy.Client().Get(proxy.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 503 {
+		t.Fatalf("status = %d, want 503", res.StatusCode)
+	}
 }

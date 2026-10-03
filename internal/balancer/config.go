@@ -2,6 +2,7 @@ package balancer
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -14,6 +15,8 @@ type Config struct {
 	Algorithm        string
 	FailureThreshold int
 	Cooldown         time.Duration
+	Rate             float64
+	Burst            int
 }
 
 func (c Config) targets() ([]*url.URL, error) {
@@ -31,6 +34,12 @@ func (c Config) targets() ([]*url.URL, error) {
 	}
 	if c.Cooldown < time.Millisecond || c.Cooldown > time.Hour {
 		return nil, fmt.Errorf("cooldown must be between 1ms and 1h")
+	}
+	if math.IsNaN(c.Rate) || math.IsInf(c.Rate, 0) || c.Rate < 0 || c.Rate > 100000 || (c.Rate > 0 && c.Rate < 0.1) {
+		return nil, fmt.Errorf("rate must be 0 to disable limiting, or between 0.1 and 100000 requests per second")
+	}
+	if c.Burst < 1 || c.Burst > 10000 {
+		return nil, fmt.Errorf("burst must be between 1 and 10000")
 	}
 	seen := make(map[string]bool)
 	targets := make([]*url.URL, 0, len(c.Backends))

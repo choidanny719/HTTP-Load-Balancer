@@ -22,10 +22,13 @@ func main() {
 	algorithm := flag.String("algorithm", "round-robin", "round-robin or least-connections")
 	threshold := flag.Int("failure-threshold", 3, "consecutive failures before opening a circuit")
 	cooldown := flag.Duration("cooldown", 10*time.Second, "delay before a recovery probe")
+	rate := flag.Float64("rate", 20, "requests per second per client IP; 0 disables limiting")
+	burst := flag.Int("burst", 40, "requests allowed in a burst")
 	flag.Parse()
 	b, err := balancer.New(balancer.Config{
 		Backends: strings.Split(*backends, ","), Timeout: *timeout, Algorithm: *algorithm,
 		FailureThreshold: *threshold, Cooldown: *cooldown,
+		Rate: *rate, Burst: *burst,
 	})
 	if err != nil {
 		slog.Error("configuration", "error", err)

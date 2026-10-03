@@ -1,20 +1,27 @@
 package balancer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
+	"strconv"
 	"time"
 )
+
+const maxRequestBytes = 1 << 20
 
 type Balancer struct {
 	pool      *pool
 	transport *http.Transport
 	timeout   time.Duration
+	limiter   *limiter
+	slots     chan struct{}
 }
 
 func New(config Config) (*Balancer, error) {
@@ -26,6 +33,9 @@ func New(config Config) (*Balancer, error) {
 	}
 	if config.Cooldown == 0 {
 		config.Cooldown = 10 * time.Second
+	}
+	if config.Burst == 0 {
+		config.Burst = 40
 	}
 	targets, err := config.targets()
 	if err != nil {
@@ -40,7 +50,10 @@ func New(config Config) (*Balancer, error) {
 	for _, target := range targets {
 		p.backends = append(p.backends, &backend{url: target})
 	}
-	return &Balancer{pool: p, transport: transport, timeout: config.Timeout}, nil
+	return &Balancer{
+		pool: p, transport: transport, timeout: config.Timeout,
+		limiter: newLimiter(config.Rate, config.Burst), slots: make(chan struct{}, 256),
+	}, nil
 }
 
 func (b *Balancer) Close() {
@@ -52,8 +65,52 @@ func (b *Balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "only ordinary HTTP requests are supported")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), b.timeout)
+	client, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		client = r.RemoteAddr
+	}
+	if allowed, retry := b.limiter.allow(client, time.Now()); !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
+		writeError(w, http.StatusTooManyRequests, "client request limit reached")
+		return
+	}
+	select {
+	case b.slots <- struct{}{}:
+		defer func() { <-b.slots }()
+	default:
+		writeError(w, http.StatusServiceUnavailable, "proxy is at capacity")
+		return
+	}
+	clientContext := r.Context()
+	ctx, cancel := context.WithTimeout(clientContext, b.timeout)
 	defer cancel()
+	reader := http.NewResponseController(w)
+	if r.Body != http.NoBody {
+		reader.SetReadDeadline(time.Now().Add(b.timeout))
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
+	r.Body.Close()
+	reader.SetReadDeadline(time.Time{})
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		var networkError net.Error
+		switch {
+		case errors.As(err, &tooLarge):
+			writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds 1 MiB")
+		case errors.As(err, &networkError) && networkError.Timeout():
+			writeError(w, http.StatusRequestTimeout, "request body timed out")
+		default:
+			writeError(w, http.StatusBadRequest, "could not read request body")
+		}
+		return
+	}
+	r = r.WithContext(ctx)
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	r.TransferEncoding = nil
+	if len(body) == 0 {
+		r.Body = http.NoBody
+	}
 	reservation := b.pool.pick(time.Now())
 	if reservation == nil {
 		writeError(w, http.StatusServiceUnavailable, "all backend circuits are open")
@@ -62,7 +119,7 @@ func (b *Balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	result := healthy
 	defer func() {
 		panicValue := recover()
-		if r.Context().Err() != nil {
+		if clientContext.Err() != nil {
 			result = canceled
 		} else if panicValue != nil || ctx.Err() != nil {
 			result = failed
@@ -87,7 +144,7 @@ func (b *Balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		},
 		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
 			result = failed
-			if r.Context().Err() != nil {
+			if clientContext.Err() != nil {
 				return
 			}
 			if errors.Is(err, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded {
@@ -97,7 +154,7 @@ func (b *Balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadGateway, "backend unavailable")
 		},
 	}
-	proxy.ServeHTTP(w, r.WithContext(ctx))
+	proxy.ServeHTTP(w, r)
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
