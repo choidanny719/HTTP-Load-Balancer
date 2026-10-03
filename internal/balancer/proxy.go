@@ -12,12 +12,21 @@ import (
 )
 
 type Balancer struct {
-	pool      pool
+	pool      *pool
 	transport *http.Transport
 	timeout   time.Duration
 }
 
 func New(config Config) (*Balancer, error) {
+	if config.Algorithm == "" {
+		config.Algorithm = "round-robin"
+	}
+	if config.FailureThreshold == 0 {
+		config.FailureThreshold = 3
+	}
+	if config.Cooldown == 0 {
+		config.Cooldown = 10 * time.Second
+	}
 	targets, err := config.targets()
 	if err != nil {
 		return nil, err
@@ -27,7 +36,11 @@ func New(config Config) (*Balancer, error) {
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 20
 	transport.ResponseHeaderTimeout = config.Timeout
-	return &Balancer{pool: pool{targets: targets}, transport: transport, timeout: config.Timeout}, nil
+	p := &pool{algorithm: config.Algorithm, failureThreshold: config.FailureThreshold, cooldown: config.Cooldown}
+	for _, target := range targets {
+		p.backends = append(p.backends, &backend{url: target})
+	}
+	return &Balancer{pool: p, transport: transport, timeout: config.Timeout}, nil
 }
 
 func (b *Balancer) Close() {
@@ -41,15 +54,39 @@ func (b *Balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), b.timeout)
 	defer cancel()
-	target := b.pool.pick()
+	reservation := b.pool.pick(time.Now())
+	if reservation == nil {
+		writeError(w, http.StatusServiceUnavailable, "all backend circuits are open")
+		return
+	}
+	result := healthy
+	defer func() {
+		panicValue := recover()
+		if r.Context().Err() != nil {
+			result = canceled
+		} else if panicValue != nil || ctx.Err() != nil {
+			result = failed
+		}
+		b.pool.finish(reservation, result, time.Now())
+		if panicValue != nil {
+			panic(panicValue)
+		}
+	}()
 	proxy := httputil.ReverseProxy{
 		Rewrite: func(req *httputil.ProxyRequest) {
-			req.SetURL(target)
+			req.SetURL(reservation.backend.url)
 			req.SetXForwarded()
 		},
 		Transport: b.transport,
 		ErrorLog:  log.New(io.Discard, "", 0),
+		ModifyResponse: func(response *http.Response) error {
+			if response.StatusCode >= 500 {
+				result = failed
+			}
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
+			result = failed
 			if r.Context().Err() != nil {
 				return
 			}

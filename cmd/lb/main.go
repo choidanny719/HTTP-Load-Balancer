@@ -19,8 +19,14 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:8080", "proxy listen address")
 	backends := flag.String("backends", "", "comma-separated backend origins")
 	timeout := flag.Duration("timeout", 5*time.Second, "request deadline")
+	algorithm := flag.String("algorithm", "round-robin", "round-robin or least-connections")
+	threshold := flag.Int("failure-threshold", 3, "consecutive failures before opening a circuit")
+	cooldown := flag.Duration("cooldown", 10*time.Second, "delay before a recovery probe")
 	flag.Parse()
-	b, err := balancer.New(balancer.Config{Backends: strings.Split(*backends, ","), Timeout: *timeout})
+	b, err := balancer.New(balancer.Config{
+		Backends: strings.Split(*backends, ","), Timeout: *timeout, Algorithm: *algorithm,
+		FailureThreshold: *threshold, Cooldown: *cooldown,
+	})
 	if err != nil {
 		slog.Error("configuration", "error", err)
 		os.Exit(1)

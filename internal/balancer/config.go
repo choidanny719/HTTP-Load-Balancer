@@ -9,8 +9,11 @@ import (
 )
 
 type Config struct {
-	Backends []string
-	Timeout  time.Duration
+	Backends         []string
+	Timeout          time.Duration
+	Algorithm        string
+	FailureThreshold int
+	Cooldown         time.Duration
 }
 
 func (c Config) targets() ([]*url.URL, error) {
@@ -19,6 +22,15 @@ func (c Config) targets() ([]*url.URL, error) {
 	}
 	if c.Timeout < time.Millisecond || c.Timeout > time.Minute {
 		return nil, fmt.Errorf("timeout must be between 1ms and 1m")
+	}
+	if c.Algorithm != "round-robin" && c.Algorithm != "least-connections" {
+		return nil, fmt.Errorf("algorithm must be round-robin or least-connections")
+	}
+	if c.FailureThreshold < 1 || c.FailureThreshold > 100 {
+		return nil, fmt.Errorf("failure threshold must be between 1 and 100")
+	}
+	if c.Cooldown < time.Millisecond || c.Cooldown > time.Hour {
+		return nil, fmt.Errorf("cooldown must be between 1ms and 1h")
 	}
 	seen := make(map[string]bool)
 	targets := make([]*url.URL, 0, len(c.Backends))

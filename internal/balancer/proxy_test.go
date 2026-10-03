@@ -128,3 +128,54 @@ func TestInvalidBackends(t *testing.T) {
 		t.Error("accepted duplicate origins")
 	}
 }
+
+func TestFailedWritesAreNotRetriedAndCircuitSkipsBackend(t *testing.T) {
+	var calls atomic.Int64
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "failed", http.StatusInternalServerError)
+	}))
+	defer bad.Close()
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer good.Close()
+	_, proxy := testProxy(t, Config{Backends: []string{bad.URL, good.URL}, Timeout: time.Second, FailureThreshold: 1})
+	for i, want := range []int{500, 200, 200, 200} {
+		res, err := proxy.Client().Post(proxy.URL+"/orders", "text/plain", strings.NewReader("order"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+		if res.StatusCode != want {
+			t.Fatalf("request %d: got %d, want %d", i, res.StatusCode, want)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("failed backend received %d requests", calls.Load())
+	}
+}
+
+func TestAllCircuitsOpen(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer backend.Close()
+	_, proxy := testProxy(t, Config{Backends: []string{backend.URL}, Timeout: time.Second, FailureThreshold: 1})
+	for _, want := range []int{503, 503} {
+		res, err := proxy.Client().Get(proxy.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if res.StatusCode != want {
+			t.Fatalf("status = %d", res.StatusCode)
+		}
+		if strings.Contains(string(body), "all backend circuits are open") {
+			return
+		}
+	}
+	t.Fatal("proxy did not reject after the circuit opened")
+}
