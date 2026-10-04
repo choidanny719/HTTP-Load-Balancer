@@ -1,0 +1,47 @@
+services:
+  proxy:
+    build: .
+    image: http-load-balancer:local
+    command:
+      - -listen=0.0.0.0:8080
+      - -admin=0.0.0.0:9090
+      - -backends=http://backend-1:9000,http://backend-2:9000,http://backend-3:9000
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      backend-1:
+        condition: service_started
+      backend-2:
+        condition: service_started
+      backend-3:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+  backend-1:
+    build: .
+    image: http-load-balancer:local
+    entrypoint: ["backend"]
+    command: ["-listen=0.0.0.0:9000", "-name=backend-1"]
+  backend-2:
+    build: .
+    image: http-load-balancer:local
+    entrypoint: ["backend"]
+    command: ["-listen=0.0.0.0:9000", "-name=backend-2"]
+  backend-3:
+    build: .
+    image: http-load-balancer:local
+    entrypoint: ["backend"]
+    command: ["-listen=0.0.0.0:9000", "-name=backend-3"]
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9091:9090"
+    depends_on:
+      proxy:
+        condition: service_healthy

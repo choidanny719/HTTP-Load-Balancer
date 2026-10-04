@@ -1,9 +1,12 @@
 package balancer
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -268,5 +271,77 @@ func TestCapacityRejectsWithoutQueueing(t *testing.T) {
 	res.Body.Close()
 	if res.StatusCode != 503 {
 		t.Fatalf("status = %d, want 503", res.StatusCode)
+	}
+}
+
+func TestSlowUploadDoesNotReachBackend(t *testing.T) {
+	var calls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+	}))
+	defer upstream.Close()
+	_, proxy := testProxy(t, Config{Backends: []string{upstream.URL}, Timeout: 50 * time.Millisecond})
+	conn, err := net.Dial("tcp", strings.TrimPrefix(proxy.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	fmt.Fprint(conn, "POST / HTTP/1.1\r\nHost: proxy\r\nContent-Length: 20\r\n\r\nx")
+	res, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 408 || calls.Load() != 0 {
+		t.Fatalf("status = %d, backend calls = %d", res.StatusCode, calls.Load())
+	}
+}
+
+func TestClientCancellationLeavesCircuitClosed(t *testing.T) {
+	started := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+	b, proxy := testProxy(t, Config{Backends: []string{upstream.URL}, Timeout: time.Second, FailureThreshold: 1})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", proxy.URL, nil)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		res, _ := proxy.Client().Do(req)
+		if res != nil {
+			res.Body.Close()
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("backend did not receive request")
+	}
+	cancel()
+	<-done
+	deadline := time.After(time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		b.pool.mu.Lock()
+		active := b.pool.backends[0].active
+		failures := b.pool.backends[0].failures
+		b.pool.mu.Unlock()
+		if active == 0 {
+			if failures != 0 {
+				t.Fatal("client cancellation counted as backend failure")
+			}
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline:
+			t.Fatal("canceled request did not release backend")
+		}
 	}
 }
