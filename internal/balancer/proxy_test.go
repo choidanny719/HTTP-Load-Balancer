@@ -37,6 +37,9 @@ func TestForwardRequest(t *testing.T) {
 		if r.Header.Get("X-Forwarded-For") != "127.0.0.1" || r.Header.Get("Forwarded") != "" {
 			t.Error("untrusted forwarding headers were not replaced")
 		}
+		if r.Header.Get("X-Forwarded-Host") != "proxy.example" || r.Header.Get("X-Forwarded-Proto") != "http" {
+			t.Error("forwarded host or protocol came from untrusted headers")
+		}
 		if r.Header.Get("X-Remove") != "" {
 			t.Error("hop-by-hop header reached backend")
 		}
@@ -47,7 +50,10 @@ func TestForwardRequest(t *testing.T) {
 	defer upstream.Close()
 	_, proxy := testProxy(t, Config{Backends: []string{upstream.URL}, Timeout: time.Second})
 	req, _ := http.NewRequest("POST", proxy.URL+"/items/a%2Fb?q=two+words", strings.NewReader("payload"))
+	req.Host = "proxy.example"
 	req.Header.Set("X-Forwarded-For", "spoofed")
+	req.Header.Set("X-Forwarded-Host", "spoofed.example")
+	req.Header.Set("X-Forwarded-Proto", "https")
 	req.Header.Set("Forwarded", "for=spoofed")
 	req.Header.Set("Connection", "X-Remove")
 	req.Header.Set("X-Remove", "secret")
@@ -219,23 +225,29 @@ func TestBodyLimit(t *testing.T) {
 	}))
 	defer upstream.Close()
 	b, proxy := testProxy(t, Config{Backends: []string{upstream.URL}, Timeout: time.Second})
-	for _, size := range []int{maxRequestBytes, maxRequestBytes + 1} {
-		req, _ := http.NewRequest("POST", proxy.URL, bytes.NewReader(make([]byte, size)))
-		req.ContentLength = -1
-		res, err := proxy.Client().Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		res.Body.Close()
-		want := 200
-		if size > maxRequestBytes {
-			want = 413
-		}
-		if res.StatusCode != want {
-			t.Fatalf("size %d: got %d, want %d", size, res.StatusCode, want)
+	for _, chunked := range []bool{false, true} {
+		for _, size := range []int{maxRequestBytes, maxRequestBytes + 1} {
+			req, _ := http.NewRequest("POST", proxy.URL, bytes.NewReader(make([]byte, size)))
+			if chunked {
+				req.ContentLength = -1
+			}
+			res, err := proxy.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			res.Body.Close()
+			want := 200
+			if size > maxRequestBytes {
+				want = 413
+			}
+			if res.StatusCode != want {
+				t.Fatalf("size %d: got %d, want %d", size, res.StatusCode, want)
+			}
 		}
 	}
-	if calls.Load() != 1 || b.pool.backends[0].failures != 0 {
+	b.pool.mu.Lock()
+	defer b.pool.mu.Unlock()
+	if calls.Load() != 2 || b.pool.backends[0].failures != 0 {
 		t.Fatal("oversized request reached backend or changed its health")
 	}
 }

@@ -60,3 +60,45 @@ func TestLimiterConcurrencyAndExpiry(t *testing.T) {
 		t.Fatal("expired client was not removed")
 	}
 }
+
+func TestDisabledLimiterDoesNotTrackClients(t *testing.T) {
+	l := newLimiter(0, 1)
+	for range 20 {
+		if ok, retry := l.allow("client", time.Now()); !ok || retry != 0 {
+			t.Fatal("disabled limiter rejected a request")
+		}
+	}
+	if len(l.clients) != 0 {
+		t.Fatal("disabled limiter retained client state")
+	}
+}
+
+func TestSlowBucketsAreNotResetByIdleExpiry(t *testing.T) {
+	l := newLimiter(0.1, 100)
+	now := time.Now()
+	for range 100 {
+		l.allow("a", now)
+	}
+	now = now.Add(10 * time.Minute)
+	for range 60 {
+		if ok, _ := l.allow("a", now); !ok {
+			t.Fatal("refilled token rejected")
+		}
+	}
+	if ok, retry := l.allow("a", now); ok || retry != 10 {
+		t.Fatal("idle expiry granted a fresh burst before the bucket refilled")
+	}
+}
+
+func TestFullClientTableStillServesExistingClients(t *testing.T) {
+	l := newLimiter(1, 1)
+	l.maxClients = 1
+	now := time.Now()
+	l.allow("a", now)
+	if ok, _ := l.allow("b", now); ok {
+		t.Fatal("new client exceeded table capacity")
+	}
+	if ok, _ := l.allow("a", now.Add(time.Second)); !ok {
+		t.Fatal("full table blocked an existing client's refilled bucket")
+	}
+}

@@ -106,3 +106,65 @@ func TestCanceledRequestsDoNotCountAsFailures(t *testing.T) {
 		t.Fatal("canceled probe left backend stuck")
 	}
 }
+
+func TestSuccessfulRequestResetsFailureStreak(t *testing.T) {
+	p := testPool("round-robin", 1)
+	now := time.Now()
+	for _, result := range []outcome{failed, failed, healthy, failed, failed} {
+		r := p.pick(now)
+		if r == nil {
+			t.Fatal("nonconsecutive failures opened circuit")
+		}
+		p.finish(r, result, now)
+	}
+	r := p.pick(now)
+	if r == nil {
+		t.Fatal("successful request did not reset failure streak")
+	}
+	p.finish(r, failed, now)
+	if p.pick(now) != nil {
+		t.Fatal("three consecutive failures did not open circuit")
+	}
+}
+
+func TestStaleFailureCannotReopenRecoveredBackend(t *testing.T) {
+	p := testPool("least-connections", 1)
+	p.failureThreshold = 1
+	now := time.Now()
+	old := p.pick(now)
+	p.finish(p.pick(now), failed, now)
+	now = now.Add(p.cooldown)
+	p.finish(p.pick(now), healthy, now)
+	p.finish(old, failed, now)
+	r := p.pick(now)
+	if r == nil {
+		t.Fatal("old failure reopened a recovered backend")
+	}
+	p.finish(r, healthy, now)
+	if p.backends[0].active != 0 {
+		t.Fatal("stale completion leaked an active request")
+	}
+}
+
+func TestBothAlgorithmsSkipUnavailableBackends(t *testing.T) {
+	for _, algorithm := range []string{"round-robin", "least-connections"} {
+		t.Run(algorithm, func(t *testing.T) {
+			p := testPool(algorithm, 2)
+			p.failureThreshold = 1
+			now := time.Now()
+			bad := p.pick(now)
+			p.finish(bad, failed, now)
+			for range 10 {
+				r := p.pick(now)
+				if r == nil || r.backend == bad.backend {
+					t.Fatal("did not select available backend")
+				}
+				p.finish(r, healthy, now)
+			}
+			p.finish(p.pick(now), failed, now)
+			if p.pick(now) != nil {
+				t.Fatal("selected a backend when every circuit was open")
+			}
+		})
+	}
+}

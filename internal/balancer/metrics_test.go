@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -70,5 +71,70 @@ func TestStreamedResponse(t *testing.T) {
 	body, err := io.ReadAll(response.Body)
 	if err != nil || string(body) != "first\nsecond\n" {
 		t.Fatalf("stream = %q, error = %v", body, err)
+	}
+}
+
+func TestMetricsWhileRequestsAreActive(t *testing.T) {
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var once sync.Once
+	finish := func() { once.Do(func() { close(release) }) }
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		select {
+		case <-release:
+			w.WriteHeader(http.StatusCreated)
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	b, _ := testProxy(t, Config{Backends: []string{upstream.URL}, Timeout: 5 * time.Second})
+	var workers sync.WaitGroup
+	t.Cleanup(workers.Wait)
+	t.Cleanup(finish)
+	for range 2 {
+		workers.Go(func() {
+			response := httptest.NewRecorder()
+			b.ServeHTTP(response, httptest.NewRequest("GET", "http://proxy/", nil))
+			if response.Code != 201 {
+				t.Errorf("status = %d, want 201", response.Code)
+			}
+		})
+	}
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("requests did not reach backend")
+		}
+	}
+	admin := b.AdminHandler()
+	for range 10 {
+		response := httptest.NewRecorder()
+		admin.ServeHTTP(response, httptest.NewRequest("GET", "http://admin/metrics", nil))
+		for _, metric := range []string{
+			"lb_active_requests 2",
+			`lb_backend_active_requests{backend="` + upstream.URL + `"} 2`,
+			`lb_backend_circuit_state{backend="` + upstream.URL + `"} 0`,
+		} {
+			if !strings.Contains(response.Body.String(), metric) {
+				t.Errorf("missing metric %s", metric)
+			}
+		}
+	}
+	finish()
+	workers.Wait()
+	response := httptest.NewRecorder()
+	admin.ServeHTTP(response, httptest.NewRequest("GET", "http://admin/metrics", nil))
+	for _, metric := range []string{
+		"lb_active_requests 0",
+		`lb_backend_active_requests{backend="` + upstream.URL + `"} 0`,
+		`lb_requests_total{backend="` + upstream.URL + `",code="201"} 2`,
+		`lb_request_duration_seconds_count{backend="` + upstream.URL + `"} 2`,
+		`lb_backend_failures_total{backend="` + upstream.URL + `"} 0`,
+	} {
+		if !strings.Contains(response.Body.String(), metric) {
+			t.Errorf("missing metric %s", metric)
+		}
 	}
 }
