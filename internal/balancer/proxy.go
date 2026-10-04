@@ -22,6 +22,7 @@ type Balancer struct {
 	timeout   time.Duration
 	limiter   *limiter
 	slots     chan struct{}
+	metrics   *metrics
 }
 
 func New(config Config) (*Balancer, error) {
@@ -50,10 +51,12 @@ func New(config Config) (*Balancer, error) {
 	for _, target := range targets {
 		p.backends = append(p.backends, &backend{url: target})
 	}
-	return &Balancer{
+	b := &Balancer{
 		pool: p, transport: transport, timeout: config.Timeout,
 		limiter: newLimiter(config.Rate, config.Burst), slots: make(chan struct{}, 256),
-	}, nil
+	}
+	b.metrics = newMetrics(p, b.slots)
+	return b, nil
 }
 
 func (b *Balancer) Close() {
@@ -61,6 +64,20 @@ func (b *Balancer) Close() {
 }
 
 func (b *Balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	backendName := "none"
+	response := &responseWriter{ResponseWriter: w}
+	w = response
+	defer func() {
+		status := response.status
+		if status == 0 {
+			status = http.StatusOK
+			if r.Context().Err() != nil {
+				status = 499
+			}
+		}
+		b.metrics.observe(backendName, status, time.Since(started))
+	}()
 	if r.Method == http.MethodConnect || r.Header.Get("Upgrade") != "" {
 		writeError(w, http.StatusBadRequest, "only ordinary HTTP requests are supported")
 		return
@@ -116,6 +133,7 @@ func (b *Balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "all backend circuits are open")
 		return
 	}
+	backendName = reservation.backend.url.String()
 	result := healthy
 	defer func() {
 		panicValue := recover()
@@ -125,6 +143,9 @@ func (b *Balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			result = failed
 		}
 		b.pool.finish(reservation, result, time.Now())
+		if result == failed {
+			b.metrics.failures.WithLabelValues(backendName).Inc()
+		}
 		if panicValue != nil {
 			panic(panicValue)
 		}
