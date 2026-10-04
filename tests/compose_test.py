@@ -1,5 +1,6 @@
 import json
 import subprocess
+import time
 import urllib.parse
 
 from process_test import request, wait_for
@@ -18,6 +19,12 @@ wait_for(lambda: request("http://127.0.0.1:9090/healthz")[0] == 200)
 responses = [backend() for _ in range(9)]
 assert all(status == 200 for status, _ in responses), responses
 assert {name for _, name in responses} == {"backend-1", "backend-2", "backend-3"}, responses
+started = time.monotonic()
+status, body = request("http://127.0.0.1:8080/slow")
+assert status == 200 and json.loads(body)["path"] == "/slow", (status, body)
+assert time.monotonic() - started >= 1.8
+status, body = request("http://127.0.0.1:8080/fail")
+assert status == 500 and json.loads(body)["path"] == "/fail", (status, body)
 compose("stop", "backend-1")
 try:
     responses = [backend() for _ in range(12)]
@@ -39,4 +46,13 @@ def scraped():
 
 
 wait_for(scraped, timeout=20)
-print("Docker routing, backend outage, recovery, and Prometheus scraping passed.")
+for metric in ["lb_requests_total", "lb_request_duration_seconds_count", "lb_backend_failures_total"]:
+    query = urllib.parse.urlencode({"query": f"sum({metric})"})
+
+    def recorded():
+        status, body = request("http://127.0.0.1:9091/api/v1/query?" + query)
+        results = json.loads(body).get("data", {}).get("result", [])
+        return status == 200 and results and float(results[0]["value"][1]) > 0
+
+    wait_for(recorded, timeout=20)
+print("Docker routing, slow/error responses, outage recovery, and Prometheus queries passed.")

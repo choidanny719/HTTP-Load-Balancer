@@ -1,4 +1,5 @@
 import http.server
+import http.client
 import json
 import pathlib
 import socket
@@ -13,9 +14,9 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
-def request(url):
+def request(url, timeout=4):
     try:
-        response = urllib.request.urlopen(url, timeout=4)
+        response = urllib.request.urlopen(url, timeout=timeout)
     except urllib.error.HTTPError as error:
         response = error
     with response:
@@ -44,13 +45,16 @@ class Backend(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/hold":
             self.server.started.set()
-            self.server.release.wait(3)
+            self.server.release.wait(15)
         body = json.dumps({"backend": self.server.name}).encode()
         self.send_response(200 if self.server.healthy else 500)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def log_message(self, *args):
         pass
@@ -69,18 +73,28 @@ class ProcessTests(unittest.TestCase):
             self.addCleanup(server.server_close)
             self.addCleanup(server.shutdown)
             self.backends.append(server)
-        self.proxy = f"http://127.0.0.1:{free_port()}"
-        self.admin = f"http://127.0.0.1:{free_port()}"
+        self.process = None
+        self.addCleanup(self.stop)
+        self.start()
+
+    def start(self, *options):
+        proxy_port = free_port()
+        admin_port = free_port()
+        while admin_port == proxy_port:
+            admin_port = free_port()
+        self.proxy = f"http://127.0.0.1:{proxy_port}"
+        self.admin = f"http://127.0.0.1:{admin_port}"
         origins = ",".join(f"http://127.0.0.1:{s.server_port}" for s in self.backends)
         self.process = subprocess.Popen([
             str(ROOT / "bin/lb"), f"-listen={self.proxy.removeprefix('http://')}",
             f"-admin={self.admin.removeprefix('http://')}", f"-backends={origins}",
-            "-rate=0", "-timeout=4s", "-failure-threshold=1", "-cooldown=200ms",
+            "-rate=0", "-timeout=4s", "-failure-threshold=1", "-cooldown=1s", *options,
         ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        self.addCleanup(self.stop)
         wait_for(lambda: request(self.admin + "/healthz")[0] == 200)
 
     def stop(self):
+        if self.process is None:
+            return
         if self.process.poll() is None:
             self.process.terminate()
             try:
@@ -136,6 +150,54 @@ class ProcessTests(unittest.TestCase):
             ], capture_output=True, timeout=5)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(b"configuration", result.stderr)
+
+    def test_least_connections_avoids_busy_backend(self):
+        self.stop()
+        self.start("-algorithm=least-connections")
+        result = []
+        worker = threading.Thread(target=lambda: result.append(request(self.proxy + "/hold")))
+        worker.start()
+        self.addCleanup(worker.join, 5)
+        self.addCleanup(self.backends[0].release.set)
+        self.assertTrue(self.backends[0].started.wait(2))
+        names = [json.loads(request(self.proxy + "/")[1])["backend"] for _ in range(6)]
+        self.assertEqual(names, ["backend-2", "backend-3"] * 3)
+        self.backends[0].release.set()
+        worker.join(5)
+        self.assertEqual(result[0][0], 200)
+        names = {json.loads(request(self.proxy + "/")[1])["backend"] for _ in range(6)}
+        self.assertEqual(names, {"backend-1", "backend-2", "backend-3"})
+
+    def test_shutdown_deadline_closes_stalled_request(self):
+        self.stop()
+        self.start("-timeout=30s")
+        result = []
+
+        def hold():
+            try:
+                result.append(request(self.proxy + "/hold", timeout=10))
+            except (OSError, http.client.HTTPException) as error:
+                result.append(error)
+
+        worker = threading.Thread(target=hold)
+        worker.start()
+        self.addCleanup(worker.join, 10)
+        self.addCleanup(self.backends[0].release.set)
+        self.assertTrue(self.backends[0].started.wait(2))
+        started = time.monotonic()
+        self.process.terminate()
+        self.assertEqual(self.process.wait(timeout=9), 0)
+        self.assertGreaterEqual(time.monotonic() - started, 4.5)
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertIsInstance(result[0], (OSError, http.client.HTTPException))
+
+    def test_large_headers_are_rejected(self):
+        req = urllib.request.Request(self.proxy + "/", headers={"X-Large": "x" * (40 << 10)})
+        with self.assertRaises(urllib.error.HTTPError) as response:
+            urllib.request.urlopen(req, timeout=4)
+        self.assertEqual(response.exception.code, 431)
+        response.exception.close()
 
 
 if __name__ == "__main__":
