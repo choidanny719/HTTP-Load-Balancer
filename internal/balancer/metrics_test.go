@@ -4,11 +4,145 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"net/textproto"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestResponseWriterRecordsFinalStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+	}{
+		{"implicit OK", 0},
+		{"explicit status", http.StatusAccepted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			writer := &responseWriter{ResponseWriter: recorder}
+			want := http.StatusOK
+			if tc.status != 0 {
+				writer.WriteHeader(tc.status)
+				want = tc.status
+			}
+			n, err := writer.Write([]byte("accepted"))
+			writer.WriteHeader(http.StatusInternalServerError)
+			if err != nil || n != len("accepted") || recorder.Body.String() != "accepted" {
+				t.Fatalf("body = %q, bytes = %d, error = %v", recorder.Body.String(), n, err)
+			}
+			if writer.status != want || recorder.Code != want {
+				t.Fatalf("recorded status = %d, sent status = %d, want %d", writer.status, recorder.Code, want)
+			}
+		})
+	}
+}
+
+func TestEarlyHintsPreserveFinalResponseAndMetrics(t *testing.T) {
+	const link = "</style.css>; rel=preload; as=style"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", link)
+		w.WriteHeader(http.StatusEarlyHints)
+		w.Header().Del("Link")
+		w.WriteHeader(http.StatusCreated)
+		io.WriteString(w, "created")
+	}))
+	defer upstream.Close()
+	b, proxy := testProxy(t, Config{Backends: []string{upstream.URL}, Timeout: time.Second})
+	hints := make(chan textproto.MIMEHeader, 1)
+	req, err := http.NewRequest("GET", proxy.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		Got1xxResponse: func(code int, header textproto.MIMEHeader) error {
+			if code != http.StatusEarlyHints {
+				t.Errorf("informational status = %d, want 103", code)
+			}
+			select {
+			case hints <- textproto.MIMEHeader(http.Header(header).Clone()):
+			default:
+				t.Error("received more than one informational response")
+			}
+			return nil
+		},
+	}))
+	response, err := proxy.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil || response.StatusCode != http.StatusCreated || string(body) != "created" {
+		t.Fatalf("final status = %d, body = %q, error = %v", response.StatusCode, body, err)
+	}
+	select {
+	case header := <-hints:
+		if header.Get("Link") != link {
+			t.Fatalf("early hints Link = %q, want %q", header.Get("Link"), link)
+		}
+	default:
+		t.Fatal("early hints were not forwarded")
+	}
+	if response.Header.Get("Link") != "" {
+		t.Fatal("informational header leaked into final response")
+	}
+	metric := `lb_requests_total{backend="` + upstream.URL + `",code="201"} 1`
+	deadline := time.Now().Add(time.Second)
+	for {
+		scrape := httptest.NewRecorder()
+		b.AdminHandler().ServeHTTP(scrape, httptest.NewRequest("GET", "http://admin/metrics", nil))
+		if strings.Contains(scrape.Body.String(), `code="103"`) {
+			t.Fatal("informational response counted as a completed request")
+		}
+		if strings.Contains(scrape.Body.String(), metric) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("missing metric %s", metric)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestCircuitMetricsFollowRecovery(t *testing.T) {
+	const target = "http://backend.example"
+	b, err := New(Config{Backends: []string{target}, Timeout: time.Second, FailureThreshold: 1, Cooldown: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	assertState := func(state string, active string) {
+		t.Helper()
+		response := httptest.NewRecorder()
+		b.AdminHandler().ServeHTTP(response, httptest.NewRequest("GET", "http://admin/metrics", nil))
+		for _, metric := range []string{
+			`lb_backend_circuit_state{backend="` + target + `"} ` + state,
+			`lb_backend_active_requests{backend="` + target + `"} ` + active,
+		} {
+			if !strings.Contains(response.Body.String(), metric) {
+				t.Errorf("missing metric %s", metric)
+			}
+		}
+	}
+	now := time.Now()
+	assertState("0", "0")
+	request := b.pool.pick(now)
+	if request == nil {
+		t.Fatal("healthy backend was not available")
+	}
+	b.pool.finish(request, failed, now)
+	assertState("1", "0")
+	probe := b.pool.pick(now.Add(time.Second))
+	if probe == nil {
+		t.Fatal("backend was not available for a recovery probe")
+	}
+	assertState("2", "1")
+	b.pool.finish(probe, healthy, now.Add(time.Second))
+	assertState("0", "0")
+}
 
 func TestMetricsAndAdminIsolation(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

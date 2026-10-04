@@ -28,6 +28,38 @@ func testProxy(t *testing.T, config Config) (*Balancer, *httptest.Server) {
 	return b, server
 }
 
+func TestRateLimitGroupsRequestsByClientAddress(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	for _, tc := range []struct {
+		name, first, sameClient, otherClient string
+	}{
+		{"IPv4 ports", "192.0.2.1:1000", "192.0.2.1:2000", "192.0.2.2:1000"},
+		{"IPv6 ports", "[2001:db8::1]:1000", "[2001:db8::1]:2000", "[2001:db8::2]:1000"},
+		{"address without port", "192.0.2.1", "192.0.2.1", "192.0.2.2"},
+		{"IPv6 without port", "2001:db8::1", "2001:db8::1", "2001:db8::2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, _ := testProxy(t, Config{Backends: []string{upstream.URL}, Timeout: time.Second, Rate: 0.1, Burst: 1})
+			for i, address := range []string{tc.first, tc.sameClient, tc.otherClient} {
+				request := httptest.NewRequest("GET", "http://proxy/", nil)
+				request.RemoteAddr = address
+				response := httptest.NewRecorder()
+				b.ServeHTTP(response, request)
+				want := http.StatusNoContent
+				if i == 1 {
+					want = http.StatusTooManyRequests
+				}
+				if response.Code != want {
+					t.Errorf("request from %q: status = %d, want %d", address, response.Code, want)
+				}
+			}
+		})
+	}
+}
+
 func TestForwardRequest(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
