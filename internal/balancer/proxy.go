@@ -14,8 +14,6 @@ import (
 	"time"
 )
 
-const maxRequestBytes = 1 << 20
-
 type Balancer struct {
 	pool      *pool
 	transport *http.Transport
@@ -101,24 +99,8 @@ func (b *Balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	clientContext := r.Context()
 	ctx, cancel := context.WithTimeout(clientContext, b.timeout)
 	defer cancel()
-	reader := http.NewResponseController(w)
-	if r.Body != http.NoBody {
-		reader.SetReadDeadline(time.Now().Add(b.timeout))
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
-	r.Body.Close()
-	reader.SetReadDeadline(time.Time{})
-	if err != nil {
-		var tooLarge *http.MaxBytesError
-		var networkError net.Error
-		switch {
-		case errors.As(err, &tooLarge):
-			writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds 1 MiB")
-		case errors.As(err, &networkError) && networkError.Timeout():
-			writeError(w, http.StatusRequestTimeout, "request body timed out")
-		default:
-			writeError(w, http.StatusBadRequest, "could not read request body")
-		}
+	body, ok := b.readRequestBody(w, r)
+	if !ok {
 		return
 	}
 	r = r.WithContext(ctx)
